@@ -480,14 +480,12 @@ export default function Room() {
               )}
 
               <div className="flex flex-col gap-2">
-                <h4 className="text-xs text-gray-500 uppercase tracking-widest">Guess History</h4>
-                {guessLog.length === 0
+                <h4 className="text-xs text-gray-500 uppercase tracking-widest">Your Guesses</h4>
+                {guessLog.filter(e => e.guesser === myId).length === 0
                   ? <p className="text-gray-700 text-sm text-center py-4">No guesses yet</p>
-                  : [...guessLog].reverse().map(entry => {
-                    const isMine = entry.guesser === myId;
-                    return (
-                      <div key={entry.id} className={`flex items-center gap-3 bg-gray-900 rounded-xl px-4 py-3 border ${isMine ? 'border-indigo-900' : 'border-gray-800'}`}>
-                        <span className="text-xs text-gray-500 w-16 shrink-0">{isMine ? 'You' : entry.guesserName}</span>
+                  : [...guessLog].filter(e => e.guesser === myId).reverse().map(entry => (
+                      <div key={entry.id} className="flex items-center gap-3 bg-gray-900 rounded-xl px-4 py-3 border border-indigo-900">
+                        <span className="text-xs text-gray-500 w-16 shrink-0">You</span>
                         <span className="font-bold text-white text-lg w-10 text-center">{entry.value}</span>
                         <span className={`text-sm font-semibold ml-auto ${
                           entry.result === 'correct' ? 'text-green-400'
@@ -497,8 +495,7 @@ export default function Room() {
                           {entry.result === 'correct' ? '✓ Correct!' : entry.result === 'higher' ? '↑ Go Higher' : '↓ Go Lower'}
                         </span>
                       </div>
-                    );
-                  })
+                    ))
                 }
               </div>
             </div>
@@ -525,20 +522,24 @@ export default function Room() {
                 ))}
               </div>
 
-              <div className="w-full flex flex-col gap-2 max-h-48 overflow-y-auto">
-                {guessLog.map(entry => {
-                  const isMine = entry.guesser === myId;
-                  return (
-                    <div key={entry.id} className="flex items-center gap-3 bg-gray-900 rounded-xl px-4 py-2.5 border border-gray-800 text-sm">
-                      <span className="text-gray-500 w-14 shrink-0">{isMine ? 'You' : entry.guesserName}</span>
-                      <span className="font-bold text-white w-8 text-center">{entry.value}</span>
-                      <span className={`ml-auto font-semibold ${entry.result === 'correct' ? 'text-green-400' : entry.result === 'higher' ? 'text-blue-400' : 'text-orange-400'}`}>
-                        {entry.result === 'correct' ? '✓' : entry.result === 'higher' ? '↑ Higher' : '↓ Lower'}
-                      </span>
-                    </div>
-                  );
-                })}
-              </div>
+              {guessLog.length > 0 && (
+                <div className="w-full flex flex-col gap-1.5 max-h-56 overflow-y-auto">
+                  <h4 className="text-xs text-gray-500 uppercase tracking-widest mb-1">Full Game Log</h4>
+                  {guessLog.map((entry, i) => {
+                    const isMine = entry.guesser === myId;
+                    return (
+                      <div key={entry.id} className={`flex items-center gap-3 rounded-xl px-4 py-2.5 border text-sm ${isMine ? 'bg-gray-900 border-indigo-900' : 'bg-gray-900/60 border-gray-800'}`}>
+                        <span className="text-gray-600 text-xs w-5 shrink-0 text-right">{i + 1}.</span>
+                        <span className={`w-16 shrink-0 text-xs font-medium ${isMine ? 'text-indigo-400' : 'text-gray-400'}`}>{isMine ? 'You' : entry.guesserName}</span>
+                        <span className="font-bold text-white w-8 text-center">{entry.value}</span>
+                        <span className={`ml-auto font-semibold ${entry.result === 'correct' ? 'text-green-400' : entry.result === 'higher' ? 'text-blue-400' : 'text-orange-400'}`}>
+                          {entry.result === 'correct' ? '✓ Correct' : entry.result === 'higher' ? '↑ Higher' : '↓ Lower'}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
 
               <button
                 onClick={handleRematch}
