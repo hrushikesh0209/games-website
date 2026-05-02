@@ -10,3 +10,13 @@ export interface ChatMsg {
   text: string;
   ts: number;
 }
+
+export interface GuessEntry {
+  id: string;
+  guesser: string;
+  guesserName: string;
+  value: number;
+  result: 'higher' | 'lower' | 'correct';
+}
+
+export type GamePhase = 'lobby' | 'selecting' | 'toss' | 'guessing' | 'ended';
