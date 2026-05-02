@@ -24,6 +24,20 @@ const io = new Server(httpServer, {
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
+function buildClientGameState(state: HoLState, socketId: string) {
+  const base = {
+    phase: state.phase,
+    currentTurn: state.currentTurn,
+    tossWinner: state.tossWinner,
+    guessLog: state.guessLog,
+    mySecretSet: state.secrets[socketId] !== null && state.secrets[socketId] !== undefined,
+  };
+  if (state.phase === 'ended') {
+    return { ...base, winner: state.winner, winnerName: state.winnerName, secrets: state.secrets as Record<string, number> };
+  }
+  return base;
+}
+
 function isString(v: unknown, maxLen: number): v is string {
   return typeof v === 'string' && v.trim().length > 0 && v.length <= maxLen;
 }
@@ -105,8 +119,11 @@ io.on('connection', (socket) => {
   // ── room:request_state ───────────────────────────────────────────────────────
   socket.on('room:request_state', () => {
     const room = rm.getRoomBySocketId(socket.id);
-    if (!room) return;
-    socket.emit('room:state', { room: { id: room.id, game: room.game }, players: room.players });
+    if (!room) { socket.emit('room:not_found'); return; }
+    const gs = room.gameState
+      ? buildClientGameState(room.gameState as HoLState, socket.id)
+      : null;
+    socket.emit('room:state', { room: { id: room.id, game: room.game }, players: room.players, gameState: gs });
   });
 
   // ── game:ready ───────────────────────────────────────────────────────────────
@@ -143,13 +160,14 @@ io.on('connection', (socket) => {
     const firstGuesser = ids[Math.floor(Math.random() * 2)];
     const firstName = room.players.find(p => p.socketId === firstGuesser)!.name;
     state.currentTurn = firstGuesser;
+    state.tossWinner = firstGuesser;
     state.phase = 'toss';
 
     io.to(room.id).emit('game:toss_result', { firstGuesser, firstName });
 
-    // Transition to guessing after 3 s
+    // Transition to guessing after 3 s — compare by reference so stale timeouts are ignored
     setTimeout(() => {
-      if ((room.gameState as HoLState | null)?.phase === 'toss') {
+      if (room.gameState === state && state.phase === 'toss') {
         state.phase = 'guessing';
         io.to(room.id).emit('game:guessing_start', { currentTurn: firstGuesser });
       }
@@ -168,8 +186,9 @@ io.on('connection', (socket) => {
     if (state.phase !== 'guessing') return;
     if (state.currentTurn !== socket.id) return;
 
-    const me = room.players.find(p => p.socketId === socket.id)!;
-    const opponent = room.players.find(p => p.socketId !== socket.id)!;
+    const me = room.players.find(p => p.socketId === socket.id);
+    const opponent = room.players.find(p => p.socketId !== socket.id);
+    if (!me || !opponent) return;
     const entry = evaluate(state, socket.id, me.name, opponent.socketId, data.value as number);
 
     if (entry.result === 'correct') {

@@ -8,6 +8,17 @@ const MAX_MESSAGES = 200;
 interface TossInfo { id: string; name: string }
 interface GameResult { winner: string | null; winnerName: string | null; secrets: Record<string, number> }
 
+interface ClientGameState {
+  phase: GamePhase;
+  currentTurn: string | null;
+  tossWinner: string | null;
+  guessLog: GuessEntry[];
+  mySecretSet: boolean;
+  winner?: string | null;
+  winnerName?: string | null;
+  secrets?: Record<string, number>;
+}
+
 export default function Room() {
   const { roomId } = useParams<{ roomId: string }>();
   const location = useLocation();
@@ -41,10 +52,15 @@ export default function Room() {
   const [chatInput, setChatInput] = useState('');
   const [chatOpen, setChatOpen] = useState(false);
   const [unread, setUnread] = useState(0);
+  const chatOpenRef = useRef(false);
   const chatEndRef = useRef<HTMLDivElement>(null);
 
   // ── misc ─────────────────────────────────────────────────────────────────────
   const [copied, setCopied] = useState(false);
+  const guessInputRef = useRef<HTMLInputElement>(null);
+
+  // Keep chatOpenRef in sync with chatOpen state
+  useEffect(() => { chatOpenRef.current = chatOpen; }, [chatOpen]);
 
   useEffect(() => { if (!playerName) navigate('/', { replace: true }); }, [playerName, navigate]);
 
@@ -52,9 +68,40 @@ export default function Room() {
   useEffect(() => {
     if (!playerName) return;
 
-    const onConnect = () => { setMyId(socket.id); setConnError(false); };
+    const onConnect = () => {
+      setMyId(socket.id);
+      setConnError(false);
+      socket.emit('room:request_state');
+    };
+
     const onConnectError = () => setConnError(true);
-    const onState = ({ players: p }: { players: Player[] }) => setPlayers(p);
+
+    const onNotFound = () => navigate('/', { replace: true });
+
+    const onState = ({ players: p, gameState }: { players: Player[]; gameState: ClientGameState | null }) => {
+      setPlayers(p);
+      if (!gameState) return;
+
+      setGamePhase(gameState.phase);
+      setSecretSubmitted(gameState.mySecretSet);
+      setCurrentTurn(gameState.currentTurn);
+      setGuessLog(gameState.guessLog);
+
+      if (gameState.phase === 'toss' && gameState.tossWinner) {
+        const tw = gameState.tossWinner;
+        const name = p.find(pl => pl.socketId === tw)?.name ?? '';
+        setTossInfo({ id: tw, name });
+      }
+
+      if (gameState.phase === 'ended' && gameState.secrets) {
+        setGameResult({
+          winner: gameState.winner ?? null,
+          winnerName: gameState.winnerName ?? null,
+          secrets: gameState.secrets,
+        });
+      }
+    };
+
     const onPlayersUpdate = ({ players: p }: { players: Player[] }) => setPlayers(p);
 
     const onPlayerJoined = ({ player }: { player: Player }) => {
@@ -73,10 +120,7 @@ export default function Room() {
         const next = [...prev, msg];
         return next.length > MAX_MESSAGES ? next.slice(-MAX_MESSAGES) : next;
       });
-      setChatOpen(prev => {
-        if (!prev) setUnread(u => u + 1);
-        return prev;
-      });
+      if (!chatOpenRef.current) setUnread(u => u + 1);
     };
 
     // ── game events ──────────────────────────────────────────────────────────
@@ -113,6 +157,7 @@ export default function Room() {
 
     socket.on('connect', onConnect);
     socket.on('connect_error', onConnectError);
+    socket.on('room:not_found', onNotFound);
     socket.on('room:state', onState);
     socket.on('room:players_update', onPlayersUpdate);
     socket.on('room:player_joined', onPlayerJoined);
@@ -131,6 +176,7 @@ export default function Room() {
     return () => {
       socket.off('connect', onConnect);
       socket.off('connect_error', onConnectError);
+      socket.off('room:not_found', onNotFound);
       socket.off('room:state', onState);
       socket.off('room:players_update', onPlayersUpdate);
       socket.off('room:player_joined', onPlayerJoined);
@@ -144,7 +190,7 @@ export default function Room() {
       socket.off('game:ended', onGameEnded);
       socket.off('game:reset', onGameReset);
     };
-  }, [playerName, socket]);
+  }, [playerName, socket, navigate]);
 
   useEffect(() => {
     if (chatOpen) {
@@ -158,6 +204,14 @@ export default function Room() {
     const id = setTimeout(() => setCopied(false), 2000);
     return () => clearTimeout(id);
   }, [copied]);
+
+  // Focus guess input only when it becomes the player's turn
+  const isMyTurn = currentTurn === myId;
+  useEffect(() => {
+    if (isMyTurn && gamePhase === 'guessing') {
+      guessInputRef.current?.focus();
+    }
+  }, [isMyTurn, gamePhase]);
 
   function resetGameState() {
     setGamePhase('lobby');
@@ -208,7 +262,6 @@ export default function Room() {
   const me = players.find(p => p.socketId === myId);
   const opponent = players.find(p => p.socketId !== myId);
   const bothReady = players.length === 2 && players.every(p => p.ready);
-  const isMyTurn = currentTurn === myId;
 
   // ── render ────────────────────────────────────────────────────────────────────
   return (
@@ -315,7 +368,10 @@ export default function Room() {
                 <form onSubmit={handleSetSecret} className="w-full flex flex-col gap-3">
                   <input
                     type="number"
-                    min="0" max="99"
+                    inputMode="numeric"
+                    pattern="[0-9]*"
+                    min="0"
+                    max="99"
                     value={secretInput}
                     onChange={e => setSecretInput(e.target.value)}
                     placeholder="0 – 99"
@@ -363,12 +419,15 @@ export default function Room() {
               {isMyTurn && (
                 <form onSubmit={handleGuess} className="flex gap-2">
                   <input
+                    ref={guessInputRef}
                     type="number"
-                    min="0" max="99"
+                    inputMode="numeric"
+                    pattern="[0-9]*"
+                    min="0"
+                    max="99"
                     value={guessInput}
                     onChange={e => setGuessInput(e.target.value)}
                     placeholder="0 – 99"
-                    autoFocus
                     className="flex-1 bg-gray-900 border border-gray-700 rounded-xl px-4 py-3 text-center text-xl font-bold text-white placeholder-gray-600 focus:outline-none focus:border-indigo-500 transition-colors"
                   />
                   <button
