@@ -1,4 +1,4 @@
-import { Room, Player, GameId } from './types';
+import { Room, Player, PublicPlayer, GameId } from './types';
 
 const rooms = new Map<string, Room>();
 const socketToRoom = new Map<string, string>(); // O(1) reverse lookup
@@ -88,4 +88,25 @@ export function evictExpiredRooms(): void {
 
 export function getRoomCount(): number {
   return rooms.size;
+}
+
+export function toPublicPlayer(p: Player): PublicPlayer {
+  return { socketId: p.socketId, name: p.name, ready: p.ready };
+}
+
+export function reconnectByToken(
+  roomId: string,
+  token: string,
+  newSocketId: string,
+): { room: Room; oldSocketId: string } | null {
+  const room = rooms.get(roomId.toUpperCase());
+  if (!room) return null;
+  const player = room.players.find(p => p.reconnectToken === token);
+  if (!player || player.socketId === newSocketId) return null;
+  const oldSocketId = player.socketId;
+  socketToRoom.delete(oldSocketId);
+  socketToRoom.set(newSocketId, roomId.toUpperCase());
+  player.socketId = newSocketId;
+  touch(room);
+  return { room, oldSocketId };
 }

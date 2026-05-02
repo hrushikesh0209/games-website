@@ -28,6 +28,17 @@ export function allSecretsSet(state: HoLState): boolean {
   return Object.values(state.secrets).every(s => s !== null);
 }
 
+export function replaceSocketId(state: HoLState, oldId: string, newId: string): void {
+  if (oldId in state.secrets) {
+    state.secrets[newId] = state.secrets[oldId];
+    delete state.secrets[oldId];
+  }
+  if (state.currentTurn === oldId) state.currentTurn = newId;
+  if (state.winner === oldId) state.winner = newId;
+  if (state.tossWinner === oldId) state.tossWinner = newId;
+  state.guessLog.forEach(e => { if (e.guesser === oldId) e.guesser = newId; });
+}
+
 export function evaluate(
   state: HoLState,
   guesserSocketId: string,

@@ -5,6 +5,13 @@ export interface Player {
   socketId: string;
   name: string;
   ready: boolean;
+  reconnectToken: string;
+}
+
+export interface PublicPlayer {
+  socketId: string;
+  name: string;
+  ready: boolean;
 }
 
 export interface Room {

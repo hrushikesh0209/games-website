@@ -1,17 +1,18 @@
 import 'dotenv/config';
 import express from 'express';
 import { createServer } from 'http';
-import { Server, Socket } from 'socket.io';
+import { Server } from 'socket.io';
 import cors from 'cors';
 import helmet from 'helmet';
 import crypto from 'crypto';
 import * as rm from './roomManager';
 import { allow as rateAllow, cleanup as rateCleanup } from './rateLimit';
 import { VALID_GAMES, GameId } from './types';
-import { initGame, allSecretsSet, evaluate, HoLState } from './games/higherOrLower';
+import { initGame, allSecretsSet, evaluate, replaceSocketId, HoLState } from './games/higherOrLower';
 
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN ?? 'http://localhost:5173';
 const PORT = parseInt(process.env.PORT ?? '3001', 10);
+const RECONNECT_GRACE_MS = 15_000;
 
 const app = express();
 app.use(helmet());
@@ -22,6 +23,9 @@ const io = new Server(httpServer, {
   cors: { origin: CLIENT_ORIGIN, methods: ['GET', 'POST'] },
 });
 
+// socketId → pending grace timer
+const disconnectTimers = new Map<string, NodeJS.Timeout>();
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 function buildClientGameState(state: HoLState, socketId: string) {
@@ -30,7 +34,7 @@ function buildClientGameState(state: HoLState, socketId: string) {
     currentTurn: state.currentTurn,
     tossWinner: state.tossWinner,
     guessLog: state.guessLog,
-    mySecretSet: state.secrets[socketId] !== null && state.secrets[socketId] !== undefined,
+    mySecretSet: socketId in state.secrets && state.secrets[socketId] !== null,
   };
   if (state.phase === 'ended') {
     return { ...base, winner: state.winner, winnerName: state.winnerName, secrets: state.secrets as Record<string, number> };
@@ -50,19 +54,33 @@ function isInt(v: unknown, min: number, max: number): v is number {
   return typeof v === 'number' && Number.isInteger(v) && v >= min && v <= max;
 }
 
-function handleLeave(socket: Socket): void {
-  const room = rm.getRoomBySocketId(socket.id);
+// Fully remove player and reset game for remaining players.
+// Uses socketId string so it works for already-disconnected sockets too.
+function handleLeave(socketId: string): void {
+  const room = rm.getRoomBySocketId(socketId);
   if (!room) return;
   const roomId = room.id;
-  socket.to(roomId).emit('room:player_left', { playerId: socket.id });
-  const remaining = rm.removePlayer(socket.id);
+  io.to(roomId).except(socketId).emit('room:player_left', { playerId: socketId });
+  const remaining = rm.removePlayer(socketId);
   if (remaining) {
-    // Reset game if it was in progress
     remaining.gameState = null;
     remaining.players.forEach(p => { p.ready = false; });
-    io.to(roomId).emit('room:players_update', { players: remaining.players });
+    io.to(roomId).emit('room:players_update', { players: remaining.players.map(rm.toPublicPlayer) });
     io.to(roomId).emit('game:reset');
   }
+}
+
+// On disconnect: notify others but keep game state alive for RECONNECT_GRACE_MS.
+// If the player doesn't reconnect in time, call handleLeave to clean up.
+function scheduleLeave(socketId: string): void {
+  const room = rm.getRoomBySocketId(socketId);
+  if (!room) return;
+  io.to(room.id).except(socketId).emit('room:player_disconnected', { playerId: socketId });
+  const timer = setTimeout(() => {
+    disconnectTimers.delete(socketId);
+    handleLeave(socketId);
+  }, RECONNECT_GRACE_MS);
+  disconnectTimers.set(socketId, timer);
 }
 
 // ── connections ───────────────────────────────────────────────────────────────
@@ -73,7 +91,7 @@ io.on('connection', (socket) => {
   // ── room:create ─────────────────────────────────────────────────────────────
   socket.on('room:create', (
     payload: unknown,
-    callback: (res: { roomId: string } | { error: string }) => void,
+    callback: (res: { roomId: string; token: string } | { error: string }) => void,
   ) => {
     if (typeof callback !== 'function') return;
     if (!rateAllow(socket.id, 'room:create', 5, 60_000)) {
@@ -84,16 +102,17 @@ io.on('connection', (socket) => {
     if (!isString(data?.playerName, 20)) { callback({ error: 'Name must be 1–20 characters.' }); return; }
 
     const room = rm.createRoom(data.game);
-    const added = rm.addPlayer(room.id, { socketId: socket.id, name: (data.playerName as string).trim(), ready: false });
+    const token = crypto.randomUUID();
+    const added = rm.addPlayer(room.id, { socketId: socket.id, name: (data.playerName as string).trim(), ready: false, reconnectToken: token });
     if (!added) { callback({ error: 'Failed to create room.' }); return; }
     socket.join(room.id);
-    callback({ roomId: room.id });
+    callback({ roomId: room.id, token });
   });
 
   // ── room:join ────────────────────────────────────────────────────────────────
   socket.on('room:join', (
     payload: unknown,
-    callback: (res: { roomId: string } | { error: string }) => void,
+    callback: (res: { roomId: string; token: string } | { error: string }) => void,
   ) => {
     if (typeof callback !== 'function') return;
     if (!rateAllow(socket.id, 'room:join', 10, 60_000)) {
@@ -109,21 +128,68 @@ io.on('connection', (socket) => {
     if (room.players.some(p => p.socketId === socket.id)) { callback({ error: 'Already in this room.' }); return; }
 
     const name = (data.playerName as string).trim();
-    rm.addPlayer(room.id, { socketId: socket.id, name, ready: false });
+    const token = crypto.randomUUID();
+    rm.addPlayer(room.id, { socketId: socket.id, name, ready: false, reconnectToken: token });
     socket.join(room.id);
     const updated = rm.getRoom(room.id)!;
-    socket.to(room.id).emit('room:player_joined', { player: updated.players[updated.players.length - 1] });
-    callback({ roomId: room.id });
+    const newPlayer = updated.players[updated.players.length - 1];
+    socket.to(room.id).emit('room:player_joined', { player: rm.toPublicPlayer(newPlayer) });
+    callback({ roomId: room.id, token });
+  });
+
+  // ── room:reconnect ───────────────────────────────────────────────────────────
+  socket.on('room:reconnect', (
+    payload: unknown,
+    callback: (res: { ok: true } | { error: string }) => void,
+  ) => {
+    if (typeof callback !== 'function') return;
+    if (!rateAllow(socket.id, 'room:reconnect', 3, 10_000)) {
+      callback({ error: 'Too many reconnect attempts.' }); return;
+    }
+    const data = payload as Record<string, unknown>;
+    if (!isString(data?.roomId, 6) || !isString(data?.token, 40)) {
+      callback({ error: 'Invalid.' }); return;
+    }
+
+    const result = rm.reconnectByToken(data.roomId as string, data.token as string, socket.id);
+    if (!result) { callback({ error: 'Session expired or room not found.' }); return; }
+
+    const { room, oldSocketId } = result;
+
+    // Cancel the grace period timer for the old socket
+    const timer = disconnectTimers.get(oldSocketId);
+    if (timer) { clearTimeout(timer); disconnectTimers.delete(oldSocketId); }
+
+    // Update socketId references in active game state
+    if (room.gameState) {
+      replaceSocketId(room.gameState as HoLState, oldSocketId, socket.id);
+    }
+
+    // Re-join the Socket.IO room and notify others
+    socket.join(room.id);
+    socket.to(room.id).emit('room:player_reconnected', { playerId: socket.id });
+
+    // Send full state to the reconnected player
+    const gs = room.gameState ? buildClientGameState(room.gameState as HoLState, socket.id) : null;
+    socket.emit('room:state', {
+      room: { id: room.id, game: room.game },
+      players: room.players.map(rm.toPublicPlayer),
+      gameState: gs,
+    });
+
+    callback({ ok: true });
   });
 
   // ── room:request_state ───────────────────────────────────────────────────────
   socket.on('room:request_state', () => {
     const room = rm.getRoomBySocketId(socket.id);
     if (!room) { socket.emit('room:not_found'); return; }
-    const gs = room.gameState
-      ? buildClientGameState(room.gameState as HoLState, socket.id)
-      : null;
-    socket.emit('room:state', { room: { id: room.id, game: room.game }, players: room.players, gameState: gs });
+    const gs = room.gameState ? buildClientGameState(room.gameState as HoLState, socket.id) : null;
+    socket.emit('room:state', {
+      room: { id: room.id, game: room.game },
+      players: room.players.map(rm.toPublicPlayer),
+      gameState: gs,
+    });
   });
 
   // ── game:ready ───────────────────────────────────────────────────────────────
@@ -131,7 +197,7 @@ io.on('connection', (socket) => {
     if (!rateAllow(socket.id, 'game:ready', 3, 10_000)) return;
     const room = rm.setPlayerReady(socket.id);
     if (!room) return;
-    io.to(room.id).emit('room:players_update', { players: room.players });
+    io.to(room.id).emit('room:players_update', { players: room.players.map(rm.toPublicPlayer) });
     if (room.players.length === 2 && room.players.every(p => p.ready)) {
       room.gameState = initGame(room.players.map(p => p.socketId));
       io.to(room.id).emit('game:starting', { game: room.game });
@@ -148,7 +214,7 @@ io.on('connection', (socket) => {
     if (!room?.gameState) return;
     const state = room.gameState as HoLState;
     if (state.phase !== 'selecting') return;
-    if (state.secrets[socket.id] !== null) return; // already set
+    if (state.secrets[socket.id] !== null) return;
 
     state.secrets[socket.id] = data.value as number;
     socket.emit('game:secret_ack');
@@ -165,7 +231,7 @@ io.on('connection', (socket) => {
 
     io.to(room.id).emit('game:toss_result', { firstGuesser, firstName });
 
-    // Transition to guessing after 3 s — compare by reference so stale timeouts are ignored
+    // Compare by reference — stale timeouts from old games are ignored
     setTimeout(() => {
       if (room.gameState === state && state.phase === 'toss') {
         state.phase = 'guessing';
@@ -214,7 +280,7 @@ io.on('connection', (socket) => {
     if (!room) return;
     room.gameState = null;
     room.players.forEach(p => { p.ready = false; });
-    io.to(room.id).emit('room:players_update', { players: room.players });
+    io.to(room.id).emit('room:players_update', { players: room.players.map(rm.toPublicPlayer) });
     io.to(room.id).emit('game:reset');
   });
 
@@ -237,9 +303,11 @@ io.on('connection', (socket) => {
 
   // ── room:leave ───────────────────────────────────────────────────────────────
   socket.on('room:leave', () => {
-    const room = rm.getRoomBySocketId(socket.id);
-    const roomId = room?.id;
-    handleLeave(socket);
+    // Cancel any pending grace timer (safety — normally only set on disconnect)
+    const timer = disconnectTimers.get(socket.id);
+    if (timer) { clearTimeout(timer); disconnectTimers.delete(socket.id); }
+    const roomId = rm.getRoomBySocketId(socket.id)?.id;
+    handleLeave(socket.id);
     if (roomId) socket.leave(roomId);
   });
 
@@ -247,7 +315,7 @@ io.on('connection', (socket) => {
   socket.on('disconnect', () => {
     console.log(`- ${socket.id}`);
     rateCleanup(socket.id);
-    handleLeave(socket);
+    scheduleLeave(socket.id);
   });
 });
 

@@ -39,10 +39,11 @@ export default function Home() {
     const socket = getSocket();
 
     // Use an acknowledgement callback — no dangling socket.once listener
-    socket.emit('room:create', { game: 'higher-or-lower', playerName: name.trim() }, (res: { roomId: string } | { error: string }) => {
+    socket.emit('room:create', { game: 'higher-or-lower', playerName: name.trim() }, (res: { roomId: string; token: string } | { error: string }) => {
       if (!mounted.current) return;
       setLoading(false);
       if ('error' in res) { setError(res.error); return; }
+      sessionStorage.setItem('gameSession', JSON.stringify({ roomId: res.roomId, playerName: name.trim(), token: res.token }));
       navigate(`/room/${res.roomId}`, { state: { playerName: name.trim() } });
     });
   }
@@ -56,10 +57,11 @@ export default function Home() {
     const socket = getSocket();
     const code = joinCode.trim().toUpperCase();
 
-    socket.emit('room:join', { roomId: code, playerName: name.trim() }, (res: { roomId: string } | { error: string }) => {
+    socket.emit('room:join', { roomId: code, playerName: name.trim() }, (res: { roomId: string; token: string } | { error: string }) => {
       if (!mounted.current) return;
       setLoading(false);
       if ('error' in res) { setError(res.error); return; }
+      sessionStorage.setItem('gameSession', JSON.stringify({ roomId: res.roomId, playerName: name.trim(), token: res.token }));
       navigate(`/room/${res.roomId}`, { state: { playerName: name.trim() } });
     });
   }

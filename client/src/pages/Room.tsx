@@ -19,11 +19,22 @@ interface ClientGameState {
   secrets?: Record<string, number>;
 }
 
+interface StoredSession { roomId: string; playerName: string; token: string }
+
+function loadSession(): StoredSession | null {
+  try { return JSON.parse(sessionStorage.getItem('gameSession') ?? 'null'); } catch { return null; }
+}
+function clearSession() { sessionStorage.removeItem('gameSession'); }
+
 export default function Room() {
   const { roomId } = useParams<{ roomId: string }>();
   const location = useLocation();
   const navigate = useNavigate();
-  const playerName: string = (location.state as { playerName?: string })?.playerName ?? '';
+
+  // playerName comes from router state (fresh join) or sessionStorage (page reload)
+  const storedSession = loadSession();
+  const playerName: string =
+    (location.state as { playerName?: string })?.playerName ?? storedSession?.playerName ?? '';
 
   const socketRef = useRef(getSocket());
   const socket = socketRef.current;
@@ -36,6 +47,7 @@ export default function Room() {
   const [players, setPlayers] = useState<Player[]>([]);
   const [isReady, setIsReady] = useState(false);
   const [opponentLeft, setOpponentLeft] = useState(false);
+  const [opponentDisconnected, setOpponentDisconnected] = useState(false);
 
   // ── game ─────────────────────────────────────────────────────────────────────
   const [gamePhase, setGamePhase] = useState<GamePhase>('lobby');
@@ -59,7 +71,6 @@ export default function Room() {
   const [copied, setCopied] = useState(false);
   const guessInputRef = useRef<HTMLInputElement>(null);
 
-  // Keep chatOpenRef in sync with chatOpen state
   useEffect(() => { chatOpenRef.current = chatOpen; }, [chatOpen]);
 
   useEffect(() => { if (!playerName) navigate('/', { replace: true }); }, [playerName, navigate]);
@@ -76,10 +87,24 @@ export default function Room() {
 
     const onConnectError = () => setConnError(true);
 
-    const onNotFound = () => navigate('/', { replace: true });
+    const onNotFound = () => {
+      const session = loadSession();
+      if (session && session.roomId === roomId) {
+        socket.emit('room:reconnect', { roomId: session.roomId, token: session.token }, (res: { ok: true } | { error: string }) => {
+          if ('error' in res) {
+            clearSession();
+            navigate('/', { replace: true });
+          }
+          // On success the server emits room:state which restores everything
+        });
+      } else {
+        navigate('/', { replace: true });
+      }
+    };
 
     const onState = ({ players: p, gameState }: { players: Player[]; gameState: ClientGameState | null }) => {
       setPlayers(p);
+      setOpponentDisconnected(false);
       if (!gameState) return;
 
       setGamePhase(gameState.phase);
@@ -111,9 +136,13 @@ export default function Room() {
 
     const onPlayerLeft = () => {
       setOpponentLeft(true);
+      setOpponentDisconnected(false);
       setIsReady(false);
       resetGameState();
     };
+
+    const onPlayerDisconnected = () => setOpponentDisconnected(true);
+    const onPlayerReconnected = () => setOpponentDisconnected(false);
 
     const onChat = (msg: ChatMsg) => {
       setMessages(prev => {
@@ -162,6 +191,8 @@ export default function Room() {
     socket.on('room:players_update', onPlayersUpdate);
     socket.on('room:player_joined', onPlayerJoined);
     socket.on('room:player_left', onPlayerLeft);
+    socket.on('room:player_disconnected', onPlayerDisconnected);
+    socket.on('room:player_reconnected', onPlayerReconnected);
     socket.on('chat:message', onChat);
     socket.on('game:starting', onGameStarting);
     socket.on('game:secret_ack', onSecretAck);
@@ -181,6 +212,8 @@ export default function Room() {
       socket.off('room:players_update', onPlayersUpdate);
       socket.off('room:player_joined', onPlayerJoined);
       socket.off('room:player_left', onPlayerLeft);
+      socket.off('room:player_disconnected', onPlayerDisconnected);
+      socket.off('room:player_reconnected', onPlayerReconnected);
       socket.off('chat:message', onChat);
       socket.off('game:starting', onGameStarting);
       socket.off('game:secret_ack', onSecretAck);
@@ -190,7 +223,7 @@ export default function Room() {
       socket.off('game:ended', onGameEnded);
       socket.off('game:reset', onGameReset);
     };
-  }, [playerName, socket, navigate]);
+  }, [playerName, socket, navigate, roomId]);
 
   useEffect(() => {
     if (chatOpen) {
@@ -205,7 +238,6 @@ export default function Room() {
     return () => clearTimeout(id);
   }, [copied]);
 
-  // Focus guess input only when it becomes the player's turn
   const isMyTurn = currentTurn === myId;
   useEffect(() => {
     if (isMyTurn && gamePhase === 'guessing') {
@@ -252,7 +284,11 @@ export default function Room() {
     setChatInput('');
   }
 
-  function handleLeave() { socket.emit('room:leave'); navigate('/'); }
+  function handleLeave() {
+    clearSession();
+    socket.emit('room:leave');
+    navigate('/');
+  }
 
   function copyCode() {
     navigator.clipboard.writeText(roomId ?? '').then(() => setCopied(true));
@@ -280,7 +316,6 @@ export default function Room() {
           </button>
         </div>
 
-        {/* Chat toggle button */}
         <button
           onClick={() => { setChatOpen(o => !o); setUnread(0); }}
           className="relative text-sm bg-gray-800 hover:bg-gray-700 text-gray-300 px-3 py-1.5 rounded-lg transition-colors"
@@ -300,13 +335,19 @@ export default function Room() {
         </div>
       )}
 
+      {opponentDisconnected && (
+        <div className="bg-yellow-950 border-b border-yellow-900 text-yellow-400 text-sm px-4 py-2 text-center animate-pulse">
+          Opponent disconnected. Waiting for them to reconnect (15 s)...
+        </div>
+      )}
+
       {/* ── Body ── */}
       <div className="flex flex-1 overflow-hidden relative">
 
         {/* ── Game Area ── */}
         <div className="flex-1 overflow-y-auto p-4 md:p-8">
 
-          {/* Players strip — always visible */}
+          {/* Players strip */}
           <div className="flex gap-3 mb-6">
             {([me, opponent] as (Player | undefined)[]).map((player, i) => (
               <div key={i} className={`flex-1 bg-gray-900 rounded-xl p-3 flex items-center gap-3 border ${player ? 'border-gray-800' : 'border-gray-800 border-dashed opacity-30'}`}>
@@ -410,12 +451,10 @@ export default function Room() {
           {/* ── GUESSING ── */}
           {gamePhase === 'guessing' && (
             <div className="flex flex-col gap-5 max-w-lg mx-auto">
-              {/* Turn indicator */}
               <div className={`text-center py-3 px-4 rounded-xl font-semibold ${isMyTurn ? 'bg-green-950 border border-green-900 text-green-400' : 'bg-gray-900 border border-gray-800 text-yellow-400'}`}>
                 {isMyTurn ? '🎯 Your turn — guess their number!' : `⏳ Waiting for ${opponent?.name ?? 'opponent'} to guess...`}
               </div>
 
-              {/* Guess input */}
               {isMyTurn && (
                 <form onSubmit={handleGuess} className="flex gap-2">
                   <input
@@ -440,7 +479,6 @@ export default function Room() {
                 </form>
               )}
 
-              {/* Guess log */}
               <div className="flex flex-col gap-2">
                 <h4 className="text-xs text-gray-500 uppercase tracking-widest">Guess History</h4>
                 {guessLog.length === 0
@@ -478,7 +516,6 @@ export default function Room() {
                   : `${gameResult.winnerName} Wins!`}
               </h3>
 
-              {/* Secret reveal */}
               <div className="w-full bg-gray-900 border border-gray-800 rounded-2xl p-4 flex gap-4">
                 {players.map(p => (
                   <div key={p.socketId} className="flex-1 text-center">
@@ -488,7 +525,6 @@ export default function Room() {
                 ))}
               </div>
 
-              {/* Log summary */}
               <div className="w-full flex flex-col gap-2 max-h-48 overflow-y-auto">
                 {guessLog.map(entry => {
                   const isMine = entry.guesser === myId;
@@ -517,9 +553,7 @@ export default function Room() {
         {/* ── Chat Panel ── */}
         {chatOpen && (
           <>
-            {/* Backdrop on mobile */}
             <div className="fixed inset-0 bg-black/50 z-20 lg:hidden" onClick={() => setChatOpen(false)} />
-
             <div className="
               fixed bottom-0 left-0 right-0 h-[60vh]
               lg:static lg:h-auto lg:w-72
@@ -532,7 +566,6 @@ export default function Room() {
                 <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-widest">Chat</h3>
                 <button onClick={() => setChatOpen(false)} className="text-gray-600 hover:text-gray-300 transition-colors text-lg leading-none">×</button>
               </div>
-
               <div className="flex-1 overflow-y-auto p-4 flex flex-col gap-2" role="log" aria-live="polite">
                 {messages.length === 0 && (
                   <p className="text-xs text-gray-700 text-center mt-6">No messages yet</p>
@@ -546,7 +579,6 @@ export default function Room() {
                 ))}
                 <div ref={chatEndRef} />
               </div>
-
               <form onSubmit={handleChat} className="p-3 border-t border-gray-800 flex gap-2 shrink-0">
                 <label htmlFor="chat-input" className="sr-only">Message</label>
                 <input
