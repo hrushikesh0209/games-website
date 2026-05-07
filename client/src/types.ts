@@ -19,4 +19,4 @@ export interface GuessEntry {
   result: 'higher' | 'lower' | 'correct';
 }
 
-export type GamePhase = 'lobby' | 'selecting' | 'toss' | 'guessing' | 'ended';
+export type GamePhase = 'lobby' | 'selecting' | 'toss' | 'guessing' | 'ended' | 'ttt_playing' | 'bingo_playing';

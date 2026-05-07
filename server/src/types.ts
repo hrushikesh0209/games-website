@@ -1,4 +1,4 @@
-export const VALID_GAMES = ['higher-or-lower'] as const;
+export const VALID_GAMES = ['higher-or-lower', 'tic-tac-toe', 'bingo'] as const;
 export type GameId = typeof VALID_GAMES[number];
 
 export interface Player {
@@ -21,6 +21,7 @@ export interface Room {
   gameState: unknown;
   createdAt: number;
   lastActivityAt: number;
+  rematchVotes: Set<string>;
 }
 
 export interface ChatMessage {

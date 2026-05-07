@@ -8,11 +8,31 @@ import crypto from 'crypto';
 import * as rm from './roomManager';
 import { allow as rateAllow, cleanup as rateCleanup } from './rateLimit';
 import { VALID_GAMES, GameId } from './types';
-import { initGame, allSecretsSet, evaluate, replaceSocketId, HoLState } from './games/higherOrLower';
+import { initGame as initHoL, allSecretsSet, evaluate, replaceSocketId as holReplaceId, HoLState } from './games/higherOrLower';
+import * as ttt from './games/ticTacToe';
+import * as bingo from './games/bingo';
 
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN ?? 'http://localhost:5173';
 const PORT = parseInt(process.env.PORT ?? '3001', 10);
 const RECONNECT_GRACE_MS = 15_000;
+
+// Rate-limit budgets [maxEvents, windowMs] — named so magic numbers live in one place.
+const RL = {
+  roomCreate:    [5,  60_000] as const,
+  roomJoin:      [10, 60_000] as const,
+  roomReconnect: [3,  10_000] as const,
+  gameReady:     [3,  10_000] as const,
+  setSecret:     [3,  10_000] as const,
+  guess:         [20, 30_000] as const,
+  tttMove:       [10,  5_000] as const,
+  bingoDraw:     [10,  5_000] as const,
+  bingoClaim:    [3,  10_000] as const,
+  rematch:       [3,  10_000] as const,
+  chat:          [10,  5_000] as const,
+  voiceOffer:    [3,  30_000] as const,
+  voiceAnswer:   [3,  30_000] as const,
+  voiceIce:      [50, 10_000] as const,
+};
 
 const app = express();
 app.use(helmet());
@@ -55,11 +75,19 @@ function isInt(v: unknown, min: number, max: number): v is number {
 }
 
 // Fully remove player and reset game for remaining players.
-// Uses socketId string so it works for already-disconnected sockets too.
 function handleLeave(socketId: string): void {
   const room = rm.getRoomBySocketId(socketId);
   if (!room) return;
   const roomId = room.id;
+
+  // Cancel any pending rematch votes and notify remaining player
+  const hadVotes = room.rematchVotes.size > 0;
+  room.rematchVotes.delete(socketId);
+  if (hadVotes) {
+    room.rematchVotes.clear();
+    io.to(roomId).except(socketId).emit('game:rematch_cancelled');
+  }
+
   io.to(roomId).except(socketId).emit('room:player_left', { playerId: socketId });
   const remaining = rm.removePlayer(socketId);
   if (remaining) {
@@ -71,16 +99,65 @@ function handleLeave(socketId: string): void {
 }
 
 // On disconnect: notify others but keep game state alive for RECONNECT_GRACE_MS.
-// If the player doesn't reconnect in time, call handleLeave to clean up.
 function scheduleLeave(socketId: string): void {
   const room = rm.getRoomBySocketId(socketId);
   if (!room) return;
   io.to(room.id).except(socketId).emit('room:player_disconnected', { playerId: socketId });
+
+  // Cancel this player's rematch vote on disconnect
+  if (room.rematchVotes.has(socketId)) {
+    room.rematchVotes.delete(socketId);
+    io.to(room.id).except(socketId).emit('game:rematch_cancelled');
+  }
+
   const timer = setTimeout(() => {
     disconnectTimers.delete(socketId);
     handleLeave(socketId);
   }, RECONNECT_GRACE_MS);
   disconnectTimers.set(socketId, timer);
+}
+
+// Send game-specific state to a single socket (reconnect / request_state).
+function sendGameState(socketId: string, room: NonNullable<ReturnType<typeof rm.getRoomBySocketId>>): void {
+  if (room.game === 'higher-or-lower' && room.gameState) {
+    const gs = buildClientGameState(room.gameState as HoLState, socketId);
+    io.to(socketId).emit('room:state', {
+      room: { id: room.id, game: room.game },
+      players: room.players.map(rm.toPublicPlayer),
+      gameState: gs,
+    });
+  } else {
+    io.to(socketId).emit('room:state', {
+      room: { id: room.id, game: room.game },
+      players: room.players.map(rm.toPublicPlayer),
+      gameState: null,
+    });
+    if (room.game === 'tic-tac-toe' && room.gameState) {
+      const gs = room.gameState as ttt.TTTState;
+      io.to(socketId).emit('game:ttt_start', {
+        board: gs.board,
+        marks: gs.marks,
+        currentTurn: gs.currentTurn,
+        phase: gs.phase,
+        winner: gs.winner,
+        winnerName: gs.winnerName,
+        winLine: gs.winLine,
+      });
+    } else if (room.game === 'bingo' && room.gameState) {
+      const gs = room.gameState as bingo.BingoState;
+      io.to(socketId).emit('game:bingo_init', {
+        card: gs.cards[socketId],
+        marked: gs.marked[socketId],
+        drawn: gs.drawn,
+        available: gs.available,
+        currentDrawer: gs.currentDrawer,
+        currentNumber: gs.currentNumber,   // H-3: restore last-drawn on reconnect
+      });
+      if (gs.phase === 'ended') {
+        io.to(socketId).emit('game:ended', { winner: gs.winner, winnerName: gs.winnerName });
+      }
+    }
+  }
 }
 
 // ── connections ───────────────────────────────────────────────────────────────
@@ -94,7 +171,7 @@ io.on('connection', (socket) => {
     callback: (res: { roomId: string; token: string } | { error: string }) => void,
   ) => {
     if (typeof callback !== 'function') return;
-    if (!rateAllow(socket.id, 'room:create', 5, 60_000)) {
+    if (!rateAllow(socket.id, 'room:create', ...RL.roomCreate)) {
       callback({ error: 'Too many rooms created. Try again later.' }); return;
     }
     const data = payload as Record<string, unknown>;
@@ -115,7 +192,7 @@ io.on('connection', (socket) => {
     callback: (res: { roomId: string; token: string } | { error: string }) => void,
   ) => {
     if (typeof callback !== 'function') return;
-    if (!rateAllow(socket.id, 'room:join', 10, 60_000)) {
+    if (!rateAllow(socket.id, 'room:join', ...RL.roomJoin)) {
       callback({ error: 'Too many join attempts. Try again later.' }); return;
     }
     const data = payload as Record<string, unknown>;
@@ -143,7 +220,7 @@ io.on('connection', (socket) => {
     callback: (res: { ok: true } | { error: string }) => void,
   ) => {
     if (typeof callback !== 'function') return;
-    if (!rateAllow(socket.id, 'room:reconnect', 3, 10_000)) {
+    if (!rateAllow(socket.id, 'room:reconnect', ...RL.roomReconnect)) {
       callback({ error: 'Too many reconnect attempts.' }); return;
     }
     const data = payload as Record<string, unknown>;
@@ -162,21 +239,18 @@ io.on('connection', (socket) => {
 
     // Update socketId references in active game state
     if (room.gameState) {
-      replaceSocketId(room.gameState as HoLState, oldSocketId, socket.id);
+      if (room.game === 'tic-tac-toe') {
+        ttt.replaceSocketId(room.gameState as ttt.TTTState, oldSocketId, socket.id);
+      } else if (room.game === 'bingo') {
+        bingo.replaceSocketId(room.gameState as bingo.BingoState, oldSocketId, socket.id);
+      } else {
+        holReplaceId(room.gameState as HoLState, oldSocketId, socket.id);
+      }
     }
 
-    // Re-join the Socket.IO room and notify others
     socket.join(room.id);
     socket.to(room.id).emit('room:player_reconnected', { playerId: socket.id });
-
-    // Send full state to the reconnected player
-    const gs = room.gameState ? buildClientGameState(room.gameState as HoLState, socket.id) : null;
-    socket.emit('room:state', {
-      room: { id: room.id, game: room.game },
-      players: room.players.map(rm.toPublicPlayer),
-      gameState: gs,
-    });
-
+    sendGameState(socket.id, room);
     callback({ ok: true });
   });
 
@@ -184,34 +258,80 @@ io.on('connection', (socket) => {
   socket.on('room:request_state', () => {
     const room = rm.getRoomBySocketId(socket.id);
     if (!room) { socket.emit('room:not_found'); return; }
-    const gs = room.gameState ? buildClientGameState(room.gameState as HoLState, socket.id) : null;
-    socket.emit('room:state', {
-      room: { id: room.id, game: room.game },
-      players: room.players.map(rm.toPublicPlayer),
-      gameState: gs,
-    });
+    sendGameState(socket.id, room);
   });
 
   // ── game:ready ───────────────────────────────────────────────────────────────
   socket.on('game:ready', () => {
-    if (!rateAllow(socket.id, 'game:ready', 3, 10_000)) return;
+    if (!rateAllow(socket.id, 'game:ready', ...RL.gameReady)) return;
     const room = rm.setPlayerReady(socket.id);
     if (!room) return;
     io.to(room.id).emit('room:players_update', { players: room.players.map(rm.toPublicPlayer) });
+
     if (room.players.length === 2 && room.players.every(p => p.ready)) {
-      room.gameState = initGame(room.players.map(p => p.socketId));
-      io.to(room.id).emit('game:starting', { game: room.game });
+      room.rematchVotes.clear();
+      const ids = room.players.map(p => p.socketId);
+
+      if (room.game === 'tic-tac-toe') {
+        const state = ttt.initGame([ids[0], ids[1]]);
+        room.gameState = state;
+
+        // Coin toss: X player goes first
+        const xPlayer = Object.entries(state.marks).find(([, m]) => m === 'X')![0];
+        const xName = room.players.find(p => p.socketId === xPlayer)!.name;
+        io.to(room.id).emit('game:toss_result', { firstGuesser: xPlayer, firstName: xName });
+
+        setTimeout(() => {
+          if (room.gameState !== state) return;
+          io.to(room.id).emit('game:ttt_start', {
+            board: state.board,
+            marks: state.marks,
+            currentTurn: state.currentTurn,
+            phase: state.phase,
+            winner: null,
+            winnerName: null,
+            winLine: null,
+          });
+        }, 3000);
+
+      } else if (room.game === 'bingo') {
+        const firstDrawer = ids[Math.floor(Math.random() * 2)];
+        const drawerName = room.players.find(p => p.socketId === firstDrawer)!.name;
+        const state = bingo.initGame([ids[0], ids[1]], firstDrawer);
+        room.gameState = state;
+
+        io.to(room.id).emit('game:toss_result', { firstGuesser: firstDrawer, firstName: drawerName });
+
+        setTimeout(() => {
+          if (room.gameState !== state) return;
+          for (const player of room.players) {
+            io.to(player.socketId).emit('game:bingo_init', {
+              card: state.cards[player.socketId],
+              marked: state.marked[player.socketId],
+              drawn: [],
+              available: state.available,
+              currentDrawer: state.currentDrawer,
+              currentNumber: null,
+            });
+          }
+        }, 3000);
+
+      } else {
+        // Higher or Lower
+        room.gameState = initHoL([ids[0], ids[1]]);
+        io.to(room.id).emit('game:starting', { game: room.game });
+      }
     }
   });
 
   // ── game:set_secret ──────────────────────────────────────────────────────────
   socket.on('game:set_secret', (payload: unknown) => {
-    if (!rateAllow(socket.id, 'game:set_secret', 3, 10_000)) return;
+    if (!rateAllow(socket.id, 'game:set_secret', ...RL.setSecret)) return;
     const data = payload as Record<string, unknown>;
     if (!isInt(data?.value, 0, 99)) return;
 
     const room = rm.getRoomBySocketId(socket.id);
-    if (!room?.gameState) return;
+    if (!room?.gameState || room.game !== 'higher-or-lower') return;
     const state = room.gameState as HoLState;
     if (state.phase !== 'selecting') return;
     if (state.secrets[socket.id] !== null) return;
@@ -221,7 +341,6 @@ io.on('connection', (socket) => {
 
     if (!allSecretsSet(state)) return;
 
-    // Both secrets set — coin toss
     const ids = room.players.map(p => p.socketId);
     const firstGuesser = ids[Math.floor(Math.random() * 2)];
     const firstName = room.players.find(p => p.socketId === firstGuesser)!.name;
@@ -231,7 +350,6 @@ io.on('connection', (socket) => {
 
     io.to(room.id).emit('game:toss_result', { firstGuesser, firstName });
 
-    // Compare by reference — stale timeouts from old games are ignored
     setTimeout(() => {
       if (room.gameState === state && state.phase === 'toss') {
         state.phase = 'guessing';
@@ -242,12 +360,12 @@ io.on('connection', (socket) => {
 
   // ── game:guess ───────────────────────────────────────────────────────────────
   socket.on('game:guess', (payload: unknown) => {
-    if (!rateAllow(socket.id, 'game:guess', 20, 30_000)) return;
+    if (!rateAllow(socket.id, 'game:guess', ...RL.guess)) return;
     const data = payload as Record<string, unknown>;
     if (!isInt(data?.value, 0, 99)) return;
 
     const room = rm.getRoomBySocketId(socket.id);
-    if (!room?.gameState) return;
+    if (!room?.gameState || room.game !== 'higher-or-lower') return;
     const state = room.gameState as HoLState;
     if (state.phase !== 'guessing') return;
     if (state.currentTurn !== socket.id) return;
@@ -274,19 +392,157 @@ io.on('connection', (socket) => {
     }
   });
 
+  // ── game:ttt_move ────────────────────────────────────────────────────────────
+  socket.on('game:ttt_move', (payload: unknown) => {
+    if (!rateAllow(socket.id, 'game:ttt_move', ...RL.tttMove)) return;
+    const data = payload as Record<string, unknown>;
+    if (!isInt(data?.cell, 0, 8)) return;
+
+    const room = rm.getRoomBySocketId(socket.id);
+    if (!room?.gameState || room.game !== 'tic-tac-toe') return;
+    const state = room.gameState as ttt.TTTState;
+    if (state.phase !== 'playing') return;
+
+    const result = ttt.makeMove(state, socket.id, data.cell as number);
+    if (!result.valid) return;
+
+    if (result.ended && result.state.winner && result.state.winner !== 'draw') {
+      const winnerPlayer = room.players.find(p => p.socketId === result.state.winner);
+      result.state.winnerName = winnerPlayer?.name ?? null;
+    }
+
+    io.to(room.id).emit('game:ttt_update', {
+      board: result.state.board,
+      currentTurn: result.state.currentTurn,
+      phase: result.state.phase,
+      winner: result.state.winner,
+      winnerName: result.state.winnerName,
+      winLine: result.state.winLine,
+    });
+
+    if (result.ended) {
+      io.to(room.id).emit('game:ended', {
+        winner: result.state.winner,
+        winnerName: result.state.winnerName,
+      });
+    }
+  });
+
+  // ── game:bingo_draw ──────────────────────────────────────────────────────────
+  socket.on('game:bingo_draw', (payload: unknown) => {
+    if (!rateAllow(socket.id, 'game:bingo_draw', ...RL.bingoDraw)) return;
+    const data = payload as Record<string, unknown>;
+    if (!isInt(data?.number, 1, 75)) return;
+
+    const room = rm.getRoomBySocketId(socket.id);
+    if (!room?.gameState || room.game !== 'bingo') return;
+    const state = room.gameState as bingo.BingoState;
+    if (state.phase !== 'playing') return;
+    if (state.currentDrawer !== socket.id) return;
+
+    const ok = bingo.drawNumber(state, data.number as number);
+    if (!ok) return;
+
+    bingo.autoMark(state, data.number as number);
+
+    // M-2: resolve pool exhaustion BEFORE switching the drawer, so the emitted
+    // currentDrawer is null rather than pointing at a player whose turn never comes.
+    const poolExhausted = state.available.length === 0;
+    const other = room.players.find(p => p.socketId !== socket.id);
+    state.currentDrawer = poolExhausted ? null : (other?.socketId ?? null);
+
+    // C-1: send each player only their own marked grid (not the full Record).
+    for (const player of room.players) {
+      io.to(player.socketId).emit('game:bingo_drawn', {
+        number: data.number as number,
+        drawn: state.drawn,
+        available: state.available,
+        marked: state.marked[player.socketId],
+        currentDrawer: state.currentDrawer,
+      });
+    }
+
+    if (poolExhausted) {
+      state.phase = 'ended';
+      io.to(room.id).emit('game:ended', { winner: 'draw', winnerName: 'No one' });
+    }
+  });
+
+  // ── game:bingo_claim ─────────────────────────────────────────────────────────
+  socket.on('game:bingo_claim', () => {
+    if (!rateAllow(socket.id, 'game:bingo_claim', ...RL.bingoClaim)) return;
+
+    const room = rm.getRoomBySocketId(socket.id);
+    if (!room?.gameState || room.game !== 'bingo') return;
+    const state = room.gameState as bingo.BingoState;
+    if (state.phase !== 'playing') return;
+
+    const claimResult = bingo.checkBingo(state, socket.id);
+    if (!claimResult.hasBingo) return;
+
+    state.phase = 'ended';
+    state.winner = socket.id;
+    const player = room.players.find(p => p.socketId === socket.id);
+    const winnerName = player?.name ?? null;
+    state.winnerName = winnerName;
+    state.winLine = claimResult.winLine;
+
+    io.to(room.id).emit('game:ended', {
+      winner: socket.id,
+      winnerName,
+      winLine: claimResult.winLine,
+    });
+  });
+
   // ── game:rematch ─────────────────────────────────────────────────────────────
   socket.on('game:rematch', () => {
+    if (!rateAllow(socket.id, 'game:rematch', ...RL.rematch)) return;  // H-1
     const room = rm.getRoomBySocketId(socket.id);
     if (!room) return;
-    room.gameState = null;
-    room.players.forEach(p => { p.ready = false; });
-    io.to(room.id).emit('room:players_update', { players: room.players.map(rm.toPublicPlayer) });
-    io.to(room.id).emit('game:reset');
+    if (room.players.length < 2) return;
+
+    room.rematchVotes.add(socket.id);
+
+    if (room.rematchVotes.size === 1) {
+      io.to(room.id).emit('game:rematch_pending', { voterId: socket.id });
+    } else if (room.rematchVotes.size >= 2) {
+      room.gameState = null;
+      room.rematchVotes.clear();
+      room.players.forEach(p => { p.ready = false; });
+      io.to(room.id).emit('room:players_update', { players: room.players.map(rm.toPublicPlayer) });
+      io.to(room.id).emit('game:reset');
+    }
+  });
+
+  // ── voice relay handlers ─────────────────────────────────────────────────────
+  // H-2: rate-limited and shape-validated to prevent relay abuse.
+  socket.on('voice:offer', (payload: unknown) => {
+    if (!rateAllow(socket.id, 'voice:offer', ...RL.voiceOffer)) return;
+    if (typeof payload !== 'object' || payload === null || !('sdp' in payload)) return;
+    const room = rm.getRoomBySocketId(socket.id);
+    if (!room) return;
+    socket.to(room.id).emit('voice:offer', payload);
+  });
+
+  socket.on('voice:answer', (payload: unknown) => {
+    if (!rateAllow(socket.id, 'voice:answer', ...RL.voiceAnswer)) return;
+    if (typeof payload !== 'object' || payload === null || !('sdp' in payload)) return;
+    const room = rm.getRoomBySocketId(socket.id);
+    if (!room) return;
+    socket.to(room.id).emit('voice:answer', payload);
+  });
+
+  socket.on('voice:ice', (payload: unknown) => {
+    if (!rateAllow(socket.id, 'voice:ice', ...RL.voiceIce)) return;
+    if (typeof payload !== 'object' || payload === null || !('candidate' in payload)) return;
+    const room = rm.getRoomBySocketId(socket.id);
+    if (!room) return;
+    socket.to(room.id).emit('voice:ice', payload);
   });
 
   // ── chat:message ─────────────────────────────────────────────────────────────
   socket.on('chat:message', (payload: unknown) => {
-    if (!rateAllow(socket.id, 'chat:message', 10, 5_000)) return;
+    if (!rateAllow(socket.id, 'chat:message', ...RL.chat)) return;
     const data = payload as Record<string, unknown>;
     if (!isString(data?.text, 300)) return;
     const room = rm.getRoomBySocketId(socket.id);
@@ -303,7 +559,6 @@ io.on('connection', (socket) => {
 
   // ── room:leave ───────────────────────────────────────────────────────────────
   socket.on('room:leave', () => {
-    // Cancel any pending grace timer (safety — normally only set on disconnect)
     const timer = disconnectTimers.get(socket.id);
     if (timer) { clearTimeout(timer); disconnectTimers.delete(socket.id); }
     const roomId = rm.getRoomBySocketId(socket.id)?.id;

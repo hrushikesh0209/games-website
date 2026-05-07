@@ -18,7 +18,7 @@ export interface HoLState {
   winnerName: string | null;
 }
 
-export function initGame(playerIds: string[]): HoLState {
+export function initGame(playerIds: [string, string]): HoLState {
   const secrets: Record<string, number | null> = {};
   playerIds.forEach(id => { secrets[id] = null; });
   return { phase: 'selecting', secrets, currentTurn: null, tossWinner: null, guessLog: [], winner: null, winnerName: null };

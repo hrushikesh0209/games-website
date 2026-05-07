@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import { Room, Player, PublicPlayer, GameId } from './types';
 
 const rooms = new Map<string, Room>();
@@ -22,7 +23,7 @@ export function createRoom(game: GameId): Room {
   let id = generateRoomCode();
   while (rooms.has(id)) id = generateRoomCode();
   const now = Date.now();
-  const room: Room = { id, game, players: [], gameState: null, createdAt: now, lastActivityAt: now };
+  const room: Room = { id, game, players: [], gameState: null, createdAt: now, lastActivityAt: now, rematchVotes: new Set() };
   rooms.set(id, room);
   return room;
 }
@@ -86,10 +87,6 @@ export function evictExpiredRooms(): void {
   }
 }
 
-export function getRoomCount(): number {
-  return rooms.size;
-}
-
 export function toPublicPlayer(p: Player): PublicPlayer {
   return { socketId: p.socketId, name: p.name, ready: p.ready };
 }
@@ -101,7 +98,12 @@ export function reconnectByToken(
 ): { room: Room; oldSocketId: string } | null {
   const room = rooms.get(roomId.toUpperCase());
   if (!room) return null;
-  const player = room.players.find(p => p.reconnectToken === token);
+  // L-4: constant-time comparison prevents timing-based token enumeration.
+  const tokenBuf = Buffer.from(token, 'utf8');
+  const player = room.players.find(p => {
+    if (p.reconnectToken.length !== token.length) return false;
+    return crypto.timingSafeEqual(Buffer.from(p.reconnectToken, 'utf8'), tokenBuf);
+  });
   if (!player || player.socketId === newSocketId) return null;
   const oldSocketId = player.socketId;
   socketToRoom.delete(oldSocketId);
